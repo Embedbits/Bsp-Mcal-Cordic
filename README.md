@@ -14,7 +14,53 @@ This README is the landing page and the **specification of the interface** (mast
 own README with everything that is specific to the family: the instances of the device, their settings and the status of
 the implementation.
 
-> **Status: design.** No implementation exists yet, the interface below is a proposal. Stories and branches follow.
+> **Status (STM32H5, branch `Dev/STM32H5`): implemented.** The module management, the single calculation
+> (`Cordic_Set_Calculate`: all ten functions, the `q1.31` and `q1.15` formats), the settings, the range checks, the
+> float conversion helpers and the array calculation (`Cordic_Set_CalculateArray` in the POLL, ISR and DMA transfer
+> modes) are implemented against RM0481 / RM0517. Unit tests pass on the 12 STM32H5 device lines. Integration tests
+> compile (probe-rs, not run on hardware: no board access); they compare the results with double-precision
+> reference values in both formats and in the three array transfer modes, the cycle count against the software
+> library is not part of them. STM32H503, STM32H523 and STM32H533 have no CORDIC: on those lines every function
+> keeps its signature and returns `CORDIC_REQUEST_ERROR`.
+>
+> **STM32H5 notes (clarifications of the interface proposal):**
+> - **Format of the values.** In `CORDIC_FORMAT_Q31` the values of `cordic_Arguments_t` / `cordic_Results_t` are `q1.31`
+>   numbers, in `CORDIC_FORMAT_Q15` they are `q1.15` numbers sign extended to 32 bits (an argument outside of the
+>   `q1.15` range is rejected). `Value2` is ignored by the functions with one argument and is 0 for the functions with one result.
+> - **Scale.** The caller scales the arguments (`x * 2^-n`) and the results; the conversion helpers do not apply the scale.
+>   The combination of the function and the scale is checked when a calculation starts (valid exponents: 0 for the
+>   cosine, sine, phase and modulus, 0 ... 7 arctangent, 1 hyperbolic functions, 1 ... 4 logarithm, 0 ... 2 square root),
+>   so `Cordic_Set_Function` and `Cordic_Set_Scale` can be called one after the other.
+> - **Argument ranges.** The ranges of the reference manual tables (modulus 0 ... 1 for the cosine and sine, +-0.559 for
+>   the hyperbolic cosine and sine, +-0.403 for the arctangent hyperbolic, the ranges per scale of the logarithm and the
+>   square root) are checked before a register is written; the bounds are inclusive.
+> - **Conversion helpers.** `Cordic_Get_FromFloat` / `Cordic_Get_ToFloat` are the `q1.31` helpers of the proposal,
+>   `Cordic_Get_FromFloatQ15` / `Cordic_Get_ToFloatQ15` (added) are the `q1.15` ones. A number outside of `[-1, 1)` (and NaN)
+>   is rejected; the rounding is to the nearest value.
+> - **State.** `Cordic_Get_State` returns `CORDIC_STATE_IDLE`, `CORDIC_STATE_BUSY` (array calculation running, the
+>   configuration is locked) or `CORDIC_STATE_ERROR` (the last array calculation failed). The getters return
+>   `CORDIC_REQUEST_ERROR` while the module is not initialized.
+> - **Init / Deinit.** `Cordic_Init` enables the clock (Rcc), resets the peripheral (Rcc reset pulse), writes `CORDIC_CSR` and
+>   verifies it by the read-back (on a difference the module is deinitialized); a second `Cordic_Init` without
+>   `Cordic_Deinit` is rejected. `Cordic_Deinit` stops a running array calculation (no callback), releases the Gpdma
+>   channels and the interrupt, resets the peripheral and disables its clock.
+> - **Array layout.** The arrays of `cordic_ArrayRequest_t` hold the 32-bit data words of the data registers: in
+>   `CORDIC_FORMAT_Q31` one word per value (primary value first) with the number of values of the function (two
+>   arguments for the cosine, sine, phase and modulus, two results for those and for the hyperbolic cosine and sine,
+>   otherwise one), in `CORDIC_FORMAT_Q15` one word per calculation with both values packed (`CORDIC_Q15_PACK`,
+>   `CORDIC_Q15_FIRST`, `CORDIC_Q15_SECOND`). `Count` is the number of the calculations; the module cannot know the array
+>   sizes, the caller guarantees `Count` calculations in both arrays. The elements are not range checked.
+> - **Transfer modes of the array.** `CORDIC_XFER_MODE_POLL`: `Cordic_Task` calculates up to 8 calculations per call.
+>   `CORDIC_XFER_MODE_ISR`: the CORDIC interrupt reads a result and writes the next arguments (the handler is registered
+>   in Nvic by `Cordic_Init`). `CORDIC_XFER_MODE_DMA`: two Gpdma channels (`DmaWriteChannelId` memory to `CORDIC_WDATA`,
+>   request CORDIC_WRITE; `DmaReadChannelId` `CORDIC_RDATA` to memory, request CORDIC_READ; default channel 0 and 1 of
+>   GPDMA1) are configured by every request, one block per direction of at most 65535 bytes (this limits `Count`), 4 byte
+>   aligned arrays; the channels are released by the next request or by `Cordic_Deinit`. The Gpdma channel interrupts
+>   keep the priority of Gpdma / Nvic.
+> - **Callbacks.** The complete callback is called when all results are stored, the half callback when at least the half
+>   of the calculations is done (the half transfer of the result channel in the DMA mode, only if the callback is set), the
+>   error callback with `CORDIC_XFER_ERROR_DMA` (Gpdma error) or `CORDIC_XFER_ERROR_TIMEOUT` (the result was not ready in
+>   the bounded wait of the POLL mode); after an error the peripheral is reset and the settings are written again.
 
 ---
 
@@ -70,7 +116,7 @@ master.
 
 | Family | Branch | Coprocessor | Status |
 |---|---|---|---|
-| STM32H5 | `Dev/STM32H5` | `CORDIC` on STM32H543, H553, H562, H563, H573 and the H5E / H5F lines: 24-bit rotation engine, circular and hyperbolic modes, rotation and vectoring, the ten functions, programmable precision, DMA read and write channels | planned (first) |
+| STM32H5 | `Dev/STM32H5` | `CORDIC` on STM32H543, H553, H562, H563, H573 and the H5E / H5F lines (no CORDIC on H503, H523, H533): 24-bit rotation engine, circular and hyperbolic modes, rotation and vectoring, the ten functions, programmable precision, DMA read and write channels | implemented |
 | STM32G4 | `Dev/STM32G4` | `CORDIC` | planned |
 | STM32H7 | `Dev/STM32H7` | `CORDIC` on the lines that have it | planned |
 | STM32U5, STM32U3 | `Dev/STM32U5`, `Dev/STM32U3` | device dependent | planned |
