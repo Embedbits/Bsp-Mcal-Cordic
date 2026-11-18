@@ -14,7 +14,74 @@ This README is the landing page and the **specification of the interface** (mast
 own README with everything that is specific to the family: the instances of the device, their settings and the status of
 the implementation.
 
-> **Status: design.** No implementation exists yet, the interface below is a proposal. Stories and branches follow.
+> **Status (STM32H7, branch `Dev/STM32H7`): implemented.** Port of the STM32H5 module to the CORDIC of the STM32H723 /
+> H725 / H730 / H733 / H735 lines (RM0468 chapter 22) and of the STM32H7R / STM32H7S lines (Ral family STM32H7RS, RM0477
+> chapter 22) - the same registers `CORDIC_CSR` / `WDATA` / `RDATA` (CMSIS bit definitions identical) and the same
+> function tables as RM0481 chapter 20: the module management, the single calculation (all ten functions, the `q1.31`
+> and `q1.15` formats), the settings, the range checks, the float conversion helpers and the array calculation in the
+> POLL, ISR and DMA transfer modes. The other STM32H7 lines (H742 / H743 / H745 / H747 / H750 / H753 / H755 / H757,
+> H7A3 / H7B0 / H7B3) have no CORDIC: every function checks `defined(CORDIC)` and returns `CORDIC_REQUEST_ERROR`. The
+> module compiles without warnings for the 22 STM32H7 lines, for the Cortex-M4 of the 6 dual-core lines and for the 4
+> STM32H7R / STM32H7S lines. Unit tests (Unity + CMock + RegMem, 62 cases; the DMA cases with the Dma mock on the
+> classic lines and the Gpdma mock on STM32H7R / H7S): STM32H723, H7R3 and H7S7 61 pass (the case of a line without the
+> CORDIC is ignored), STM32H743, H755, H7A3, H7B3 (no CORDIC) 2 pass. Integration tests (8 cases: the functions against
+> double-precision values in both formats, the POLL / ISR / DMA array modes): the firmware builds for all 27 STM32H7 /
+> H7R / H7S presets (STM32H7R / H7S with `-DINTEGRATION_TEST_OPTIMIZATION=-Os`, 64 KB flash); NUCLEO-H723ZG 8 of 8 in
+> 3 runs (DMA mode by DMA1 streams 0 / 1), NUCLEO-H7A3ZI-Q and NUCLEO-H755ZI-Q (no CORDIC) ignore all cases; the run on
+> a STM32H7R / H7S board (GPDMA1, NUCLEO-H7S3L8) is pending - the board is not on the IT agent.
+>
+> **STM32H7 specifics:**
+>
+> - **DMA controller of the line.** The classic lines move the arrays by two streams of DMA1 or DMA2 (Dma module, DMAMUX1
+>   requests CORDIC_WRITE / CORDIC_READ, RM0468 Table 118; default DMA1 stream 0 and stream 1): `cordic_DmaPeriphId_t` /
+>   `cordic_DmaChannelId_t` / `cordic_DmaPriority_t` are the types of the Dma module, one block is at most 65535 data
+>   words (`DMA_SxNDTR`), the streams run in the direct mode (32-bit words on both sides). The STM32H7R / STM32H7S lines
+>   use two channels of GPDMA1 (Gpdma module, requests CORDIC_WRITE / CORDIC_READ, RM0477 Table 90; default channel 0
+>   and channel 1, blocks of at most 65535 bytes as on STM32H5); HPDMA1 has no CORDIC request, `Cordic_Init` in the DMA
+>   mode rejects `DmaPeriphId` = `GPDMA_PERIPH_2`.
+> - **Memory of the arrays (DMA mode).** DMA1 / DMA2 reach the AXI SRAM and SRAM1 .. SRAM4, not the DTCM / ITCM; with the
+>   data cache enabled the caller cleans the input array before and invalidates the output array after the request.
+> - **Device errata.** ES0491 Rev 9 (STM32H72x / H73x) and ES0596 Rev 10 (STM32H7R / H7S) list no CORDIC erratum; the
+>   DMAMUX erratum ES0491 2.7.3 concerns the request synchronization, which the module does not use.
+>
+> **Interface notes (as on STM32H5):**
+> - **Format of the values.** In `CORDIC_FORMAT_Q31` the values of `cordic_Arguments_t` / `cordic_Results_t` are `q1.31`
+>   numbers, in `CORDIC_FORMAT_Q15` they are `q1.15` numbers sign extended to 32 bits (an argument outside of the
+>   `q1.15` range is rejected). `Value2` is ignored by the functions with one argument and is 0 for the functions with one result.
+> - **Scale.** The caller scales the arguments (`x * 2^-n`) and the results; the conversion helpers do not apply the scale.
+>   The combination of the function and the scale is checked when a calculation starts (valid exponents: 0 for the
+>   cosine, sine, phase and modulus, 0 ... 7 arctangent, 1 hyperbolic functions, 1 ... 4 logarithm, 0 ... 2 square root),
+>   so `Cordic_Set_Function` and `Cordic_Set_Scale` can be called one after the other.
+> - **Argument ranges.** The ranges of the reference manual tables (modulus 0 ... 1 for the cosine and sine, +-0.559 for
+>   the hyperbolic cosine and sine, +-0.403 for the arctangent hyperbolic, the ranges per scale of the logarithm and the
+>   square root) are checked before a register is written; the bounds are inclusive.
+> - **Conversion helpers.** `Cordic_Get_FromFloat` / `Cordic_Get_ToFloat` are the `q1.31` helpers of the proposal,
+>   `Cordic_Get_FromFloatQ15` / `Cordic_Get_ToFloatQ15` (added) are the `q1.15` ones. A number outside of `[-1, 1)` (and NaN)
+>   is rejected; the rounding is to the nearest value.
+> - **State.** `Cordic_Get_State` returns `CORDIC_STATE_IDLE`, `CORDIC_STATE_BUSY` (array calculation running, the
+>   configuration is locked) or `CORDIC_STATE_ERROR` (the last array calculation failed). The getters return
+>   `CORDIC_REQUEST_ERROR` while the module is not initialized.
+> - **Init / Deinit.** `Cordic_Init` enables the clock (Rcc), resets the peripheral (Rcc reset pulse), writes `CORDIC_CSR` and
+>   verifies it by the read-back (on a difference the module is deinitialized); a second `Cordic_Init` without
+>   `Cordic_Deinit` is rejected. `Cordic_Deinit` stops a running array calculation (no callback), releases the DMA
+>   channels and the interrupt, resets the peripheral and disables its clock.
+> - **Array layout.** The arrays of `cordic_ArrayRequest_t` hold the 32-bit data words of the data registers: in
+>   `CORDIC_FORMAT_Q31` one word per value (primary value first) with the number of values of the function (two
+>   arguments for the cosine, sine, phase and modulus, two results for those and for the hyperbolic cosine and sine,
+>   otherwise one), in `CORDIC_FORMAT_Q15` one word per calculation with both values packed (`CORDIC_Q15_PACK`,
+>   `CORDIC_Q15_FIRST`, `CORDIC_Q15_SECOND`). `Count` is the number of the calculations; the module cannot know the array
+>   sizes, the caller guarantees `Count` calculations in both arrays. The elements are not range checked.
+> - **Transfer modes of the array.** `CORDIC_XFER_MODE_POLL`: `Cordic_Task` calculates up to 8 calculations per call.
+>   `CORDIC_XFER_MODE_ISR`: the CORDIC interrupt reads a result and writes the next arguments (the handler is registered
+>   in Nvic by `Cordic_Init`). `CORDIC_XFER_MODE_DMA`: two DMA channels (`DmaWriteChannelId` memory to `CORDIC_WDATA`,
+>   request CORDIC_WRITE; `DmaReadChannelId` `CORDIC_RDATA` to memory, request CORDIC_READ) are configured by every
+>   request, one block per direction (this limits `Count`, see the STM32H7 specifics), 4 byte aligned arrays; the
+>   channels are released by the next request or by `Cordic_Deinit`. The DMA channel interrupts keep the priority of the
+>   Dma / Gpdma module and Nvic.
+> - **Callbacks.** The complete callback is called when all results are stored, the half callback when at least the half
+>   of the calculations is done (the half transfer of the result channel in the DMA mode, only if the callback is set), the
+>   error callback with `CORDIC_XFER_ERROR_DMA` (DMA error) or `CORDIC_XFER_ERROR_TIMEOUT` (the result was not ready in
+>   the bounded wait of the POLL mode); after an error the peripheral is reset and the settings are written again.
 
 ---
 
@@ -70,9 +137,9 @@ master.
 
 | Family | Branch | Coprocessor | Status |
 |---|---|---|---|
-| STM32H5 | `Dev/STM32H5` | `CORDIC` on STM32H543, H553, H562, H563, H573 and the H5E / H5F lines: 24-bit rotation engine, circular and hyperbolic modes, rotation and vectoring, the ten functions, programmable precision, DMA read and write channels | planned (first) |
+| STM32H5 | `Dev/STM32H5` | `CORDIC` on STM32H543, H553, H562, H563, H573 and the H5E / H5F lines (no CORDIC on H503, H523, H533): 24-bit rotation engine, circular and hyperbolic modes, rotation and vectoring, the ten functions, programmable precision, DMA read and write channels | implemented |
 | STM32G4 | `Dev/STM32G4` | `CORDIC` | planned |
-| STM32H7 | `Dev/STM32H7` | `CORDIC` on the lines that have it | planned |
+| STM32H7 | `Dev/STM32H7` | `CORDIC` on STM32H723, H725, H730, H733, H735 (RM0468) and on the STM32H7R / STM32H7S lines (Ral family STM32H7RS, RM0477), no CORDIC on the other STM32H7 lines: as STM32H5; the DMA mode by DMA1 / DMA2 streams (Dma module) on the classic lines, by GPDMA1 (Gpdma module) on STM32H7R / H7S | implemented |
 | STM32U5, STM32U3 | `Dev/STM32U5`, `Dev/STM32U3` | device dependent | planned |
 | STM32F4, STM32F7, STM32L4 | `Dev/STM32F4` ... | no CORDIC on the device - the module is a stub that returns `CORDIC_REQUEST_ERROR` | planned |
 
@@ -177,7 +244,8 @@ const cordic_ArrayRequest_t table =
 
 - **Rcc** - peripheral clock and reset
 - **Nvic** - interrupt
-- **Gpdma** - DMA transfers of the arrays
+- **Dma** - DMA transfers of the arrays on the classic STM32H7 lines (DMA1 / DMA2 streams, DMAMUX1)
+- **Gpdma** - DMA transfers of the arrays on STM32H7R / STM32H7S (GPDMA1)
 - **RAL (Register Abstraction Layer)** - used internally to access the registers
 
 All mandatory RCC, NVIC and DMA configurations are handled internally.
@@ -202,7 +270,7 @@ The module follows the common rules of the MCAL layer, so that it behaves like t
   for the device line; a pin is an item `CORDIC_<SIGNAL>_PIN_<INSTANCE>_P<port><pin>` and there is an `*_UNUSED` item. A choice
   that is not in the list cannot be written.
 - **Own peripheral only.** The module calls only the registers / LL functions of its own peripheral. The clocks, the
-  interrupts, the pins, the DMA and the EXTI lines go through the API of the Rcc, Nvic, Gpio, Gpdma and Exti modules; a
+  interrupts, the pins, the DMA and the EXTI lines go through the API of the Rcc, Nvic, Gpio, Dma / Gpdma and Exti modules; a
   missing function is added to that module, it is not bypassed.
 - **Init verifies itself.** `Cordic_Init` checks the result at the end; when it is not as required, the module is
   deinitialized and an error is returned. The waiting for the hardware is a loop on the register state with a timeout,
